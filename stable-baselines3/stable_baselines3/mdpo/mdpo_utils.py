@@ -1,4 +1,4 @@
-import pytorch as th
+import torch as th
 
 
 def get_distribution(policy, obs):
