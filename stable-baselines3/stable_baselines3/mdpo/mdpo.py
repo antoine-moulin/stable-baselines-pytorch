@@ -144,9 +144,12 @@ class MDPO(OnPolicyAlgorithm):
         for param in self.old_policy.parameters():
             param.requires_grad = False
 
+        #### Policy Optimization -------------------------------------------------------------------
+        # TODO: the optimization below should be done `sgd_steps` times, and not just once
         # For the policy network, the whole buffer is used in an update
         rollout_data = list(self.rollout_buffer.get(self.n_steps * self.n_envs))[0]
 
+        # Actions
         actions = rollout_data.actions
         if isinstance(self.action_space, spaces.Discrete):
             # Convert discrete action from float to long
@@ -182,39 +185,42 @@ class MDPO(OnPolicyAlgorithm):
         advantages = rollout_data.advantages
         advantages = (advantages - advantages.mean()) / (advantages.std() + 1e-8)
 
+        # Compute the (penalized) loss function
         if self.method == "multistep-SGD":
             # Anneal the step size from 1 to 0
             lr_now = self._current_progress_remaining + self.batch_size / self.total_timesteps
 
-            # Compute the (penalized) loss function
             # TODO: check what to do with lr_now (replace with inverse?)
             surrgain = th.mean(ratio * advantages) - meankl / lr_now
 
+        # Compute ...
         elif self.method == "closedreverse-KL":
             surrgain = th.mean(th.exp(advantages) * log_pi)
+
+        # Compute ...
         else:
             # policygain = th.mean(th.exp(advantages) * th.log(self.policy.mean_actions))
             surrgain = th.mean(ratio * advantages) - th.mean(
                 self.learning_rate_ph * ratio * log_pi)
 
-        # Optimization step for the policy
+        # TODO: check this...
         for name, param in self.policy.named_parameters():
-
             # Optimize over the policy's parameters only
             if param.name is not None and ("policy" not in param.name and "action" not in param.name):
                 param.requires_grad = False
 
+        # Should be optimizing over the policy's parameters only
         self.policy.optimizer.zero_grad()
         surrgain.backward()
-        # Clip grad norm
         th.nn.utils.clip_grad_norm_(self.policy.parameters(), self.max_grad_norm)
         self.policy.optimizer.step()
 
-        # Optimization step for the value
-        # TODO: add a loop to iterate over mini-batches instead
+
+        #### Value Optimization -------------------------------------------------------------------
+        vflosses = []  # to log the losses
 
         for rollout_data in self.rollout_buffer.get(self.batch_size):
-            # Compute the log probabilities and the values
+            # Compute the values
             values, _, _ = self.policy.evaluate_actions(rollout_data.observations, actions)
 
             if self.clip_range_vf is None:
@@ -231,22 +237,24 @@ class MDPO(OnPolicyAlgorithm):
             value_loss2 = F.mse_loss(rollout_data.returns, values_pred, reduction="none")
             vferr = th.mean(th.maximum(value_loss1, value_loss2))
 
-            # TODO: add the backprop
+            # TODO: check this...
             for name, param in self.policy.named_parameters():
-                # Optimize over the policy's parameters only
+                # Optimize over the value's parameters only
                 if param.name is not None:
                     if "value" not in param.name:
                         param.requires_grad = False
                     else:
                         param.requires_grad = True
 
+            # Should be optimizing over the value's parameters only
             self.policy.optimizer.zero_grad()
             vferr.backward()
-            # Clip grad norm
             th.nn.utils.clip_grad_norm_(self.policy.parameters(), self.max_grad_norm)
             self.policy.optimizer.step()
 
-        value_losses.append(vferr.item())  # logging
+            vflosses.append(vferr)  # logging
+
+        value_losses.append(th.mean(vflosses).item())  # logging
 
 
         # update old policy
