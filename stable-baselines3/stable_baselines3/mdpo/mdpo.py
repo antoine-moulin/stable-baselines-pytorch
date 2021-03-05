@@ -141,8 +141,8 @@ class MDPO(OnPolicyAlgorithm):
 
         t_start = time.time()
 
-        for param in self.old_policy.parameters():
-            param.requires_grad = False
+        # for param in self.old_policy.parameters():
+        #     param.requires_grad = False
 
         #### Policy Optimization -------------------------------------------------------------------
         # TODO: the optimization below should be done `sgd_steps` times, and not just once
@@ -206,20 +206,39 @@ class MDPO(OnPolicyAlgorithm):
         # TODO: check this...
         for name, param in self.policy.named_parameters():
             # Optimize over the policy's parameters only
-            if param.name is not None and ("policy" not in param.name and "action" not in param.name):
+            # print(name)
+            if "policy" not in name and "action" not in name:
                 param.requires_grad = False
 
+        with th.no_grad():
+            policy_tmp = copy.deepcopy(self.policy.state_dict())
+
+        # print("#########"+str(self._n_updates)+"#######")
+        # print(list(self.policy.parameters()))
         # Should be optimizing over the policy's parameters only
         self.policy.optimizer.zero_grad()
         surrgain.backward()
         th.nn.utils.clip_grad_norm_(self.policy.parameters(), self.max_grad_norm)
         self.policy.optimizer.step()
 
-
+        # print("###### After update #####")
+        # print(list(self.policy.parameters()))
         #### Value Optimization -------------------------------------------------------------------
+        # TODO: check this...
+        for name, param in self.policy.named_parameters():
+            # Optimize over the value's parameters only
+            if name is not None:
+                if "value" not in name:
+                    param.requires_grad = False
+                else:
+                    param.requires_grad = True
         vflosses = []  # to log the losses
 
         for rollout_data in self.rollout_buffer.get(self.batch_size):
+            actions = rollout_data.actions
+            if isinstance(self.action_space, spaces.Discrete):
+                # Convert discrete action from float to long
+                actions = rollout_data.actions.long().flatten()
             # Compute the values
             values, _, _ = self.policy.evaluate_actions(rollout_data.observations, actions)
 
@@ -237,14 +256,14 @@ class MDPO(OnPolicyAlgorithm):
             value_loss2 = F.mse_loss(rollout_data.returns, values_pred, reduction="none")
             vferr = th.mean(th.maximum(value_loss1, value_loss2))
 
-            # TODO: check this...
-            for name, param in self.policy.named_parameters():
-                # Optimize over the value's parameters only
-                if param.name is not None:
-                    if "value" not in param.name:
-                        param.requires_grad = False
-                    else:
-                        param.requires_grad = True
+            # # TODO: check this...
+            # for name, param in self.policy.named_parameters():
+            #     # Optimize over the value's parameters only
+            #     if name is not None:
+            #         if "value" not in name:
+            #             param.requires_grad = False
+            #         else:
+            #             param.requires_grad = True
 
             # Should be optimizing over the value's parameters only
             self.policy.optimizer.zero_grad()
@@ -254,12 +273,13 @@ class MDPO(OnPolicyAlgorithm):
 
             vflosses.append(vferr)  # logging
 
-        value_losses.append(th.mean(vflosses).item())  # logging
+        value_losses.append(th.mean(th.Tensor(vflosses)).item())  # logging
 
 
         # TODO: where to update the old policy without causing an error?
         # update old policy
-        # self.old_policy.load_state_dict(copy.deepcopy(self.policy.state_dict()))
+        # with th.no_grad():
+        self.old_policy.load_state_dict(policy_tmp)
         #
         # for param in self.old_policy.parameters():
         #     param.requires_grad = False
@@ -271,7 +291,7 @@ class MDPO(OnPolicyAlgorithm):
         # Logs
         # logger.record("train/entropy_loss", np.mean(entropy_losses))
         logger.record("train/policy_gradient_loss", surrgain.item())
-        logger.record("train/value_loss", vferr.item())
+        logger.record("train/value_loss", value_losses[-1])
         logger.record("train/mean_kl", meankl.item())
         logger.record("train/explained_variance", explained_var)
         if hasattr(self.policy, "log_std"):
