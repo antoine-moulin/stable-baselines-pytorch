@@ -155,6 +155,7 @@ HalfCheetahBulletEnv-v0:
                        activation_fn=nn.ReLU,
                        net_arch=[dict(pi=[256, 256], vf=[256, 256])]
                        )"
+  device: 'auto'
 
 # Tuned
 AntBulletEnv-v0:

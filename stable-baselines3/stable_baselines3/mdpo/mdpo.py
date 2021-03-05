@@ -14,6 +14,7 @@ from stable_baselines3.common.type_aliases import GymEnv, MaybeCallback, Schedul
 from stable_baselines3.common.utils import explained_variance, get_schedule_fn
 
 from stable_baselines3.mdpo.mdpo_utils import get_distribution, log_q
+import copy
 
 
 class MDPO(OnPolicyAlgorithm):
@@ -25,7 +26,6 @@ class MDPO(OnPolicyAlgorithm):
         learning_rate: Union[float, Schedule] = 3e-4,
         n_steps: int = 2048,
         batch_size: Optional[int] = 64,
-        n_epochs: int = 10,
         gamma: float = 0.99,
         gae_lambda: float = 0.95,
         clip_range_vf: Union[None, float, Schedule] = None,
@@ -89,7 +89,6 @@ class MDPO(OnPolicyAlgorithm):
                     f"Info: (n_steps={self.n_steps} and n_envs={self.env.num_envs})"
                 )
         self.batch_size = batch_size
-        self.n_epochs = n_epochs
         self.clip_range_vf = clip_range_vf
         self.target_kl = target_kl
 
@@ -101,7 +100,7 @@ class MDPO(OnPolicyAlgorithm):
         #             self.policy_class = get_policy_from_name(policy_base, policy)
         #         else:
         #             self.policy_class = policy
-        self.policy_class = ActorCriticPolicy
+        self.policy_class = ActorCriticPolicy  # TODO: turn into attribute
 
         self.old_policy = self.policy_class(
             self.observation_space,
@@ -111,8 +110,11 @@ class MDPO(OnPolicyAlgorithm):
             **self.policy_kwargs
         )
 
-        self.tsallis_q = 1.0  # TODO
-        self.method = 'multistep-SGD'  # TODO
+        # update old policy
+        self.old_policy.load_state_dict(copy.deepcopy(self.policy.state_dict()))
+
+        self.tsallis_q = 1.0  # TODO: turn into attribute
+        self.method = 'multistep-SGD'  # TODO: turn into attribute
 
     def _setup_model(self) -> None:
         super(MDPO, self)._setup_model()
@@ -139,6 +141,10 @@ class MDPO(OnPolicyAlgorithm):
 
         t_start = time.time()
 
+        for param in self.old_policy.parameters():
+            param.requires_grad = False
+
+        # For the policy network, the whole buffer is used in an update
         rollout_data = list(self.rollout_buffer.get(self.n_steps * self.n_envs))[0]
 
         actions = rollout_data.actions
@@ -146,11 +152,13 @@ class MDPO(OnPolicyAlgorithm):
             # Convert discrete action from float to long
             actions = rollout_data.actions.long().flatten()
 
-
+        # Compute the log probabilities and the values
         values, log_pi, ent = self.policy.evaluate_actions(rollout_data.observations, actions)
 
+        # Old log probabilities
         logp_pi_old = rollout_data.old_log_prob
 
+        # Compute the KL divergence between the current policy and the old policy
         if self.tsallis_q == 1.0:
             distribution_pi = get_distribution(self.policy, rollout_data.observations)
             distribution_old_pi = get_distribution(self.old_policy, rollout_data.observations)
@@ -158,25 +166,29 @@ class MDPO(OnPolicyAlgorithm):
             kloldnew = th.distributions.kl.kl_divergence(distribution_pi.distribution, distribution_old_pi.distribution)
             meankl = kloldnew.mean()
 
+        # Compute the Tsallis divergence between the current policy and the old policy
         else:
             tsallis_q = 2.0 - self.tsallis_q
-            meankl = th.mean(log_q(th.exp(logp_pi), tsallis_q) - log_q(th.exp(logp_pi_old), tsallis_q))
+            meankl = th.mean(log_q(th.exp(log_pi), tsallis_q) - log_q(th.exp(logp_pi_old), tsallis_q))
 
-        # update old policy
-        self.old_policy.load_state_dict(self.policy.state_dict().detach().clone())
-
+        # Compute entropy bonus
+        # TODO: try to incorporate it in the loss later
         meanent = th.mean(ent)
         entbonus = self.ent_coef * meanent
 
-        # advantage * pnew / pold
+        # Compute the ratio of the policies and the advantages to compute: advantages * ratios
         ratio = th.exp(log_pi - logp_pi_old)
 
         advantages = rollout_data.advantages
         advantages = (advantages - advantages.mean()) / (advantages.std() + 1e-8)
 
         if self.method == "multistep-SGD":
+            # Anneal the step size from 1 to 0
             lr_now = self._current_progress_remaining + self.batch_size / self.total_timesteps
-            surrgain = th.mean(ratio * advantages) - meankl / lr_now  # TODO: check what to do with lr_now (replace with inverse?)
+
+            # Compute the (penalized) loss function
+            # TODO: check what to do with lr_now (replace with inverse?)
+            surrgain = th.mean(ratio * advantages) - meankl / lr_now
 
         elif self.method == "closedreverse-KL":
             surrgain = th.mean(th.exp(advantages) * log_pi)
@@ -185,11 +197,12 @@ class MDPO(OnPolicyAlgorithm):
             surrgain = th.mean(ratio * advantages) - th.mean(
                 self.learning_rate_ph * ratio * log_pi)
 
-        # Optimization step
+        # Optimization step for the policy
         for name, param in self.policy.named_parameters():
+
+            # Optimize over the policy's parameters only
             if param.name is not None and ("policy" not in param.name and "action" not in param.name):
                 param.requires_grad = False
-
 
         self.policy.optimizer.zero_grad()
         surrgain.backward()
@@ -197,96 +210,53 @@ class MDPO(OnPolicyAlgorithm):
         th.nn.utils.clip_grad_norm_(self.policy.parameters(), self.max_grad_norm)
         self.policy.optimizer.step()
 
-        if self.clip_range_vf is None:
-            # No clipping
-            values_pred = values
-        else:
-            # Clip the different between old and new value
-            # NOTE: this depends on the reward scaling
-            values_pred = rollout_data.old_values + th.clamp(
-                values - rollout_data.old_values, - self.clip_range_vf, self.clip_range_vf
-            )
+        # Optimization step for the value
+        # TODO: add a loop to iterate over mini-batches instead
 
-        value_loss1 = F.mse_loss(rollout_data.returns, values, reduction="none")
-        value_loss2 = F.mse_loss(rollout_data.returns, values_pred, reduction="none")
-        vferr = th.mean(th.maximum(value_loss1, value_loss2))
+        for rollout_data in self.rollout_buffer.get(self.batch_size):
+            # Compute the log probabilities and the values
+            values, _, _ = self.policy.evaluate_actions(rollout_data.observations, actions)
 
-        value_losses.append(vferr.item())
+            if self.clip_range_vf is None:
+                # No clipping
+                values_pred = values
+            else:
+                # Clip the different between old and new value
+                # NOTE: this depends on the reward scaling
+                values_pred = rollout_data.old_values + th.clamp(
+                    values - rollout_data.old_values, - self.clip_range_vf, self.clip_range_vf
+                )
+
+            value_loss1 = F.mse_loss(rollout_data.returns, values, reduction="none")
+            value_loss2 = F.mse_loss(rollout_data.returns, values_pred, reduction="none")
+            vferr = th.mean(th.maximum(value_loss1, value_loss2))
+
+            # TODO: add the backprop
+            for name, param in self.policy.named_parameters():
+                # Optimize over the policy's parameters only
+                if param.name is not None:
+                    if "value" not in param.name:
+                        param.requires_grad = False
+                    else:
+                        param.requires_grad = True
+
+            self.policy.optimizer.zero_grad()
+            vferr.backward()
+            # Clip grad norm
+            th.nn.utils.clip_grad_norm_(self.policy.parameters(), self.max_grad_norm)
+            self.policy.optimizer.step()
+
+        value_losses.append(vferr.item())  # logging
 
 
+        # update old policy
+        # self.old_policy.load_state_dict(copy.deepcopy(self.policy.state_dict()))
+        #
+        # for param in self.old_policy.parameters():
+        #     param.requires_grad = False
 
 
-        # # train for n_epochs epochs
-        # for epoch in range(self.n_epochs):
-        #     approx_kl_divs = []
-        #     # Do a complete pass on the rollout buffer
-        #     for rollout_data in self.rollout_buffer.get(self.batch_size):
-        #         actions = rollout_data.actions
-        #         if isinstance(self.action_space, spaces.Discrete):
-        #             # Convert discrete action from float to long
-        #             actions = rollout_data.actions.long().flatten()
-        #
-        #         # Re-sample the noise matrix because the log_std has changed
-        #         # TODO: investigate why there is no issue with the gradient
-        #         # if that line is commented (as in SAC)
-        #         if self.use_sde:
-        #             self.policy.reset_noise(self.batch_size)
-        #
-        #         values, log_prob, entropy = self.policy.evaluate_actions(rollout_data.observations, actions)
-        #         values = values.flatten()
-        #         # Normalize advantage
-        #         advantages = rollout_data.advantages
-        #         advantages = (advantages - advantages.mean()) / (advantages.std() + 1e-8)
-        #
-        #         # ratio between old and new policy, should be one at the first iteration
-        #         ratio = th.exp(log_prob - rollout_data.old_log_prob)
-        #
-        #         # clipped surrogate loss
-        #         policy_loss = - th.min(advantages * ratio).mean()
-        #
-        #         # Logging
-        #         pg_losses.append(policy_loss.item())
-        #
-        #         if self.clip_range_vf is None:
-        #             # No clipping
-        #             values_pred = values
-        #         else:
-        #             # Clip the different between old and new value
-        #             # NOTE: this depends on the reward scaling
-        #             values_pred = rollout_data.old_values + th.clamp(
-        #                 values - rollout_data.old_values, -clip_range_vf, clip_range_vf
-        #             )
-        #         # Value loss using the TD(gae_lambda) target
-        #         value_loss = F.mse_loss(rollout_data.returns, values_pred)
-        #         value_losses.append(value_loss.item())
-        #
-        #         # Entropy loss favor exploration
-        #         if entropy is None:
-        #             # Approximate entropy when no analytical form
-        #             entropy_loss = -th.mean(-log_prob)
-        #         else:
-        #             entropy_loss = -th.mean(entropy)
-        #
-        #         entropy_losses.append(entropy_loss.item())
-        #
-        #         loss = policy_loss + self.ent_coef * entropy_loss + self.vf_coef * value_loss
-        #
-        #         # Optimization step
-        #         self.policy.optimizer.zero_grad()
-        #         loss.backward()
-        #         # Clip grad norm
-        #         th.nn.utils.clip_grad_norm_(self.policy.parameters(), self.max_grad_norm)
-        #         self.policy.optimizer.step()
-        #
-        #         approx_kl_divs.append(th.mean(rollout_data.old_log_prob - log_prob).detach().cpu().numpy())
-        #
-        #     all_kl_divs.append(np.mean(approx_kl_divs))
-        #
-        #     if self.target_kl is not None and np.mean(approx_kl_divs) > 1.5 * self.target_kl:
-        #         print(f"Early stopping at step {epoch} due to reaching max kl: {np.mean(approx_kl_divs):.2f}")
-        #
-
-        self._n_updates += self.n_epochs
+        self._n_updates += 1
         explained_var = explained_variance(self.rollout_buffer.values.flatten(), self.rollout_buffer.returns.flatten())
 
         # Logs
@@ -294,7 +264,6 @@ class MDPO(OnPolicyAlgorithm):
         logger.record("train/policy_gradient_loss", surrgain.item())
         logger.record("train/value_loss", vferr.item())
         logger.record("train/mean_kl", meankl.item())
-        # logger.record("train/loss", loss.item())
         logger.record("train/explained_variance", explained_var)
         if hasattr(self.policy, "log_std"):
             logger.record("train/std", th.exp(self.policy.log_std).mean().item())
