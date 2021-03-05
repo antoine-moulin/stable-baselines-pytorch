@@ -257,6 +257,7 @@ class MDPO(OnPolicyAlgorithm):
         value_losses.append(th.mean(vflosses).item())  # logging
 
 
+        # TODO: where to update the old policy without causing an error?
         # update old policy
         # self.old_policy.load_state_dict(copy.deepcopy(self.policy.state_dict()))
         #
