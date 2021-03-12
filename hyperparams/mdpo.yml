@@ -32,7 +32,7 @@ CartPole-v1:
   n_steps: 32
   batch_size: 256
   gae_lambda: 0.8
-  gamma: 0.98
+  gamma: 0.99
   ent_coef: 0.0
   learning_rate: lin_0.001
 

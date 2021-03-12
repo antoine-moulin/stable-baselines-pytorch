@@ -116,6 +116,20 @@ class MDPO(OnPolicyAlgorithm):
         self.tsallis_q = 1.0  # TODO: turn into attribute
         self.method = 'multistep-SGD'  # TODO: turn into attribute
 
+        self.sgd_steps = 15  # TODO: turn into attribute
+
+        self.policy.mlp_value_opt = self.policy.optimizer_class(self.policy.mlp_extractor.value_net.parameters(),
+                                                         lr=self.lr_schedule(1), **self.policy.optimizer_kwargs)
+        self.policy.value_opt = self.policy.optimizer_class(self.policy.value_net.parameters(),
+                                                     lr=self.lr_schedule(1), **self.policy.optimizer_kwargs)
+        self.policy.policy_opt = self.policy.optimizer_class(self.policy.mlp_extractor.policy_net.parameters(),
+                                                      lr=self.lr_schedule(1), **self.policy.optimizer_kwargs)
+        self.policy.action_opt = self.policy.optimizer_class(self.policy.action_net.parameters(),
+                                                      lr=self.lr_schedule(1), **self.policy.optimizer_kwargs)
+
+        self.cnt = 0
+
+
     def _setup_model(self) -> None:
         super(MDPO, self)._setup_model()
 
@@ -145,93 +159,88 @@ class MDPO(OnPolicyAlgorithm):
         #     param.requires_grad = False
 
         #### Policy Optimization -------------------------------------------------------------------
-        # TODO: the optimization below should be done `sgd_steps` times, and not just once
-        # For the policy network, the whole buffer is used in an update
-        rollout_data = list(self.rollout_buffer.get(self.n_steps * self.n_envs))[0]
+        for _ in range(self.sgd_steps):
+            self.cnt += 1
 
-        # Actions
-        actions = rollout_data.actions
-        if isinstance(self.action_space, spaces.Discrete):
-            # Convert discrete action from float to long
-            actions = rollout_data.actions.long().flatten()
+            # For the policy network, the whole buffer is used in an update
+            rollout_data = list(self.rollout_buffer.get(self.n_steps * self.n_envs))[0]
 
-        # Compute the log probabilities and the values
-        values, log_pi, ent = self.policy.evaluate_actions(rollout_data.observations, actions)
+            # Actions
+            actions = rollout_data.actions
+            if isinstance(self.action_space, spaces.Discrete):
+                # Convert discrete action from float to long
+                actions = rollout_data.actions.long().flatten()
 
-        # Old log probabilities
-        logp_pi_old = rollout_data.old_log_prob
+            # Compute the log probabilities and the values
+            values, log_pi, ent = self.policy.evaluate_actions(rollout_data.observations, actions)
 
-        # Compute the KL divergence between the current policy and the old policy
-        if self.tsallis_q == 1.0:
-            distribution_pi = get_distribution(self.policy, rollout_data.observations)
-            distribution_old_pi = get_distribution(self.old_policy, rollout_data.observations)
+            # Old log probabilities
+            logp_pi_old = rollout_data.old_log_prob
 
-            kloldnew = th.distributions.kl.kl_divergence(distribution_pi.distribution, distribution_old_pi.distribution)
-            meankl = kloldnew.mean()
+            # Compute the KL divergence between the current policy and the old policy
+            if self.tsallis_q == 1.0:
+                distribution_pi = get_distribution(self.policy, rollout_data.observations)
+                distribution_old_pi = get_distribution(self.old_policy, rollout_data.observations)
 
-        # Compute the Tsallis divergence between the current policy and the old policy
-        else:
-            tsallis_q = 2.0 - self.tsallis_q
-            meankl = th.mean(log_q(th.exp(log_pi), tsallis_q) - log_q(th.exp(logp_pi_old), tsallis_q))
+                kloldnew = th.distributions.kl.kl_divergence(distribution_pi.distribution, distribution_old_pi.distribution)
+                meankl = kloldnew.mean()
 
-        # Compute entropy bonus
-        # TODO: try to incorporate it in the loss later
-        meanent = th.mean(ent)
-        entbonus = self.ent_coef * meanent
+            # Compute the Tsallis divergence between the current policy and the old policy
+            else:
+                tsallis_q = 2.0 - self.tsallis_q
+                meankl = th.mean(log_q(th.exp(log_pi), tsallis_q) - log_q(th.exp(logp_pi_old), tsallis_q))
 
-        # Compute the ratio of the policies and the advantages to compute: advantages * ratios
-        ratio = th.exp(log_pi - logp_pi_old)
+            # Compute entropy bonus
+            # TODO: try to incorporate it in the loss later
+            meanent = th.mean(ent)
+            entbonus = self.ent_coef * meanent
 
-        advantages = rollout_data.advantages
-        advantages = (advantages - advantages.mean()) / (advantages.std() + 1e-8)
+            # Compute the ratio of the policies and the advantages to compute: advantages * ratios
+            ratio = th.exp(log_pi - logp_pi_old)
 
-        # Compute the (penalized) loss function
-        if self.method == "multistep-SGD":
-            # Anneal the step size from 1 to 0
-            lr_now = self._current_progress_remaining + self.batch_size / self.total_timesteps
+            advantages = rollout_data.advantages
+            advantages = (advantages - advantages.mean()) / (advantages.std() + 1e-8)
 
-            # TODO: check what to do with lr_now (replace with inverse?)
-            surrgain = th.mean(ratio * advantages) - meankl / lr_now
+            # Compute the (penalized) loss function
+            if self.method == "multistep-SGD":
+                # Anneal the step size from 1 to 0
+                lr_now = self._current_progress_remaining + self.batch_size / self.total_timesteps
 
-        # Compute ...
-        elif self.method == "closedreverse-KL":
-            surrgain = th.mean(th.exp(advantages) * log_pi)
+                lr_now = 1. - self.cnt / 601
+                lr_now = 1. / lr_now
 
-        # Compute ...
-        else:
-            # policygain = th.mean(th.exp(advantages) * th.log(self.policy.mean_actions))
-            surrgain = th.mean(ratio * advantages) - th.mean(
-                self.learning_rate_ph * ratio * log_pi)
+                # TODO: check what to do with lr_now (replace with inverse?)
+                surrgain = th.mean(ratio * advantages) - meankl / lr_now
+                surrgain = - surrgain  # torch minimizes functions
 
-        # TODO: check this...
-        for name, param in self.policy.named_parameters():
-            # Optimize over the policy's parameters only
-            # print(name)
-            if "policy" not in name and "action" not in name:
-                param.requires_grad = False
+            # Compute ...
+            elif self.method == "closedreverse-KL":
+                surrgain = th.mean(th.exp(advantages) * log_pi)
 
-        with th.no_grad():
-            policy_tmp = copy.deepcopy(self.policy.state_dict())
+            # Compute ...
+            else:
+                # policygain = th.mean(th.exp(advantages) * th.log(self.policy.mean_actions))
+                surrgain = th.mean(ratio * advantages) - th.mean(
+                    self.learning_rate_ph * ratio * log_pi)
 
-        # print("#########"+str(self._n_updates)+"#######")
-        # print(list(self.policy.parameters()))
-        # Should be optimizing over the policy's parameters only
-        self.policy.optimizer.zero_grad()
-        surrgain.backward()
-        th.nn.utils.clip_grad_norm_(self.policy.parameters(), self.max_grad_norm)
-        self.policy.optimizer.step()
+            # Should be optimizing over the policy's parameters only
+            # self.policy.optimizer.zero_grad()
+            # surrgain.backward()
+            # th.nn.utils.clip_grad_norm_(self.policy.parameters(), self.max_grad_norm)
+            # self.policy.optimizer.step()
 
-        # print("###### After update #####")
-        # print(list(self.policy.parameters()))
+            self.policy.policy_opt.zero_grad()
+            self.policy.action_opt.zero_grad()
+
+            surrgain.backward()
+
+            th.nn.utils.clip_grad_norm_(self.policy.mlp_extractor.policy_net.parameters(), self.max_grad_norm)
+            th.nn.utils.clip_grad_norm_(self.policy.action_net.parameters(), self.max_grad_norm)
+
+            self.policy.policy_opt.step()
+            self.policy.action_opt.step()
+
         #### Value Optimization -------------------------------------------------------------------
-        # TODO: check this...
-        for name, param in self.policy.named_parameters():
-            # Optimize over the value's parameters only
-            if name is not None:
-                if "value" not in name:
-                    param.requires_grad = False
-                else:
-                    param.requires_grad = True
         vflosses = []  # to log the losses
 
         for rollout_data in self.rollout_buffer.get(self.batch_size):
@@ -252,38 +261,61 @@ class MDPO(OnPolicyAlgorithm):
                     values - rollout_data.old_values, - self.clip_range_vf, self.clip_range_vf
                 )
 
-            value_loss1 = F.mse_loss(rollout_data.returns, values, reduction="none")
-            value_loss2 = F.mse_loss(rollout_data.returns, values_pred, reduction="none")
-            vferr = th.mean(th.maximum(value_loss1, value_loss2))
+            # value_loss1 = F.mse_loss(rollout_data.returns, values, reduction="none")
+            # value_loss2 = F.mse_loss(rollout_data.returns, values_pred, reduction="none")
+            # vferr = - th.mean(th.maximum(value_loss1, value_loss2))
 
-            # # TODO: check this...
-            # for name, param in self.policy.named_parameters():
-            #     # Optimize over the value's parameters only
-            #     if name is not None:
-            #         if "value" not in name:
-            #             param.requires_grad = False
-            #         else:
-            #             param.requires_grad = True
+            vferr = F.mse_loss(rollout_data.returns, values_pred)
 
             # Should be optimizing over the value's parameters only
-            self.policy.optimizer.zero_grad()
+            # policy_net_before = list(self.policy.mlp_extractor.policy_net.parameters())
+            # policy_net_before = [p.data for p in copy.deepcopy(policy_net_before)]
+            #
+            # action_net_before = list(self.policy.action_net.parameters())
+            # action_net_before = [p.data for p in copy.deepcopy(action_net_before)]
+            #
+            # mlp_value_net_before = list(self.policy.mlp_extractor.value_net.parameters())
+            # mlp_value_net_before = [p.data for p in copy.deepcopy(mlp_value_net_before)]
+            #
+            # value_net_before = list(self.policy.value_net.parameters())
+            # value_net_before = [p.data for p in copy.deepcopy(value_net_before)]
+
+            # self.policy.optimizer.zero_grad()
+            # vferr.backward()
+            # th.nn.utils.clip_grad_norm_(self.policy.parameters(), self.max_grad_norm)
+            # self.policy.optimizer.step()
+
+            self.policy.mlp_value_opt.zero_grad()
+            self.policy.value_opt.zero_grad()
+
             vferr.backward()
-            th.nn.utils.clip_grad_norm_(self.policy.parameters(), self.max_grad_norm)
-            self.policy.optimizer.step()
 
-            vflosses.append(vferr)  # logging
+            th.nn.utils.clip_grad_norm_(self.policy.mlp_extractor.value_net.parameters(), self.max_grad_norm)
+            th.nn.utils.clip_grad_norm_(self.policy.value_net.parameters(), self.max_grad_norm)
 
-        value_losses.append(th.mean(th.Tensor(vflosses)).item())  # logging
+            self.policy.mlp_value_opt.step()
+            self.policy.value_opt.step()
 
+            # policy_net_after = list(self.policy.mlp_extractor.policy_net.parameters())
+            # action_net_after = list(self.policy.action_net.parameters())
+            # mlp_value_net_after = list(self.policy.mlp_extractor.value_net.parameters())
+            # value_net_after = list(self.policy.value_net.parameters())
+            #
+            # for k in range(len(policy_net_before)):
+            #     print(f'Policy net: {th.linalg.norm(policy_net_after[k] - policy_net_before[k])}')
+            # for k in range(len(action_net_before)):
+            #         print(f'Action net: {th.linalg.norm(action_net_after[k] - action_net_before[k])}')
+            # for k in range(len(mlp_value_net_before)):
+            #         print(f'MLP value net: {th.linalg.norm(mlp_value_net_after[k] - mlp_value_net_before[k])}')
+            # for k in range(len(value_net_before)):
+            #         print(f'Value net: {th.linalg.norm(value_net_after[k] - value_net_before[k])}')
 
-        # TODO: where to update the old policy without causing an error?
-        # update old policy
-        # with th.no_grad():
-        self.old_policy.load_state_dict(policy_tmp)
-        #
-        # for param in self.old_policy.parameters():
-        #     param.requires_grad = False
+            vflosses.append(vferr.item())  # logging
 
+        with th.no_grad():
+            self.old_policy.load_state_dict(copy.deepcopy(self.policy.state_dict()))
+
+        value_losses.append(np.mean(np.array(vflosses)))  # logging
 
         self._n_updates += 1
         explained_var = explained_variance(self.rollout_buffer.values.flatten(), self.rollout_buffer.returns.flatten())
